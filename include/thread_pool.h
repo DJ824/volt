@@ -1,7 +1,14 @@
 #pragma once
 #include <functional>
 #include <future>
-
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <semaphore>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
 #include "work_steal_deque.h"
 #include "spsc_final.h"
 #include "mpsc_seq.h"
@@ -108,6 +115,7 @@ class ThreadPool {
         Worker& operator=(Worker&&) = delete;
     };
 
+    bool started_{false};
     uint64_t thread_count_;
     std::vector<std::unique_ptr<Worker>> workers_;
     std::counting_semaphore<> available_work_{0};
@@ -118,7 +126,7 @@ class ThreadPool {
     void run_task(Task* task) noexcept {
         task->run(task);
         task->destroy(task);
-        pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
+        pending_tasks_.fetch_sub(1, std::memory_order_seq_cst);
     }
 
 public:
@@ -136,7 +144,19 @@ public:
         thread_count_ = thread_ct;
     }
 
+    ~ThreadPool() {
+        stop();
+        join();
+    }
+
     void start() {
+
+        if (started_) {
+            return;
+        }
+
+        started_ = true;
+        
         for (auto& worker : workers_) {
             auto worker_ptr = worker.get();
             worker->thread = std::thread([this, worker_ptr] {
@@ -150,7 +170,7 @@ public:
         auto [task, future] = make_returning_task(std::forward<F>(f), std::forward<Args>(args)...);
 
         enqueue_external(task);
-        return future;
+        return std::move(future);
     }
 
     template <class F, class... Args>
@@ -169,7 +189,7 @@ public:
     }
 
     void worker_loop(Worker& worker) {
-        while (!stopping_.load(std::memory_order_acquire) && pending_tasks_.load(std::memory_order_acquire) != 0) {
+        while (!stopping_.load(std::memory_order_acquire) || pending_tasks_.load(std::memory_order_acquire) != 0) {
             Task* task = nullptr;
 
             if (worker.local.try_pop_bottom(task)) {
@@ -204,5 +224,18 @@ public:
         }
 
         return false;
+    }
+
+    void stop() {
+        stopping_.store(true, std::memory_order_release);
+        available_work_.release(thread_count_);
+    }
+
+    void join() {
+        for (auto& worker : workers_) {
+            if (worker->thread.joinable()) {
+                worker->thread.join();
+            }
+        }
     }
 };
