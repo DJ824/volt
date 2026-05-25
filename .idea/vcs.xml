@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/bs_thread_pool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/concurrentdeque-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/function2-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/function2-src/test/googletest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/nanobench-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/packageproject.cmake-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/riften_threadpool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/build/_deps/task_thread_pool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/bs_thread_pool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/concurrentdeque-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/function2-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/function2-src/test/googletest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/nanobench-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/packageproject.cmake-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/riften_threadpool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/task_thread_pool-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/thread-pool" vcs="Git" />
+  </component>
+</project>
