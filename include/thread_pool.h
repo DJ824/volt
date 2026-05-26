@@ -15,6 +15,7 @@
 #include "spsc_final.h"
 #include "mpsc_seq.h"
 #include "task_free_list.h"
+#include "mpmc_seq.h"
 
 class ThreadPool {
 public:
@@ -165,6 +166,7 @@ private:
                 }
                 catch (...) {
                     free_list->release(storage);
+                    // log err
                     throw;
                 }
             }
@@ -209,18 +211,19 @@ private:
     }
 
 
-    static constexpr size_t kLocalQueueSize = 1024;
-    static constexpr size_t kInboxQueueSize = 1024;
+    static constexpr size_t kLocalQueueSize = 8192;
+    static constexpr size_t kInboxQueueSize = 8192;
 
     struct Worker {
-        using Inbox = LockFreeQueueMpscSeq<Task*, kInboxQueueSize>;
+        // using Inbox = LockFreeQueueMpscSeq<Task*, kInboxQueueSize>;
+        using Inbox = LockFreeQueueMpmcSeq<Task*, kInboxQueueSize>;
         using LocalDeque = WorkStealDeque<Task*, kLocalQueueSize>;
 
         ThreadPool* pool{nullptr};
         uint64_t id{0};
         Inbox inbox;
         LocalDeque local;
-        std::counting_semaphore<> signal{0};
+        std::binary_semaphore signal{0};
         std::thread thread;
         TaskFreeList free_list;
 
@@ -300,6 +303,7 @@ public:
         auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
         auto* worker = workers_[worker_id].get();
         auto [task, future] = make_returning_task(&worker->free_list, std::forward<F>(f), std::forward<Args>(args)...);
+        // auto [task, future] = make_returning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
         pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
         enqueue_external(worker_id, task);
         return std::move(future);
@@ -310,6 +314,7 @@ public:
         auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
         auto* worker = workers_[worker_id].get();
         Task* task = make_detached_task(&worker->free_list, std::forward<F>(f), std::forward<Args>(args)...);
+        // Task* task = make_detached_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
         pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
         enqueue_external(worker_id, task);
     }
@@ -319,6 +324,8 @@ public:
         auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
         auto* worker = workers_[worker_id].get();
         Task* task = make_detached_spawning_task(&worker->free_list, std::forward<F>(f), std::forward<Args>(args)...);
+        // Task* task = make_detached_spawning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
+
         pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
         enqueue_external(worker_id, task);
     }
@@ -417,10 +424,16 @@ public:
                 continue;
             }
 
-            if (try_steal(worker, task)) {
+            if (try_steal_deque(worker, task)) {
                 run_task(task);
                 continue;
             }
+
+            if (try_steal_local(worker, task)) {
+                run_task(task);
+                continue;
+            }
+
 
             if (stopping_.load(std::memory_order_acquire) &&
                 pending_tasks_.load(std::memory_order_acquire) == 0) {
@@ -438,8 +451,43 @@ public:
         curr_worker_ = nullptr;
     }
 
+    bool try_run_once(Worker& worker) {
+        Task* task = nullptr;
 
-    bool try_steal(Worker& self, Task*& out) {
+        if (worker.local.try_pop_bottom(task)) {
+            run_task(task);
+            return true;
+        }
+
+        if (worker.inbox.try_pop(task)) {
+            run_task(task);
+            return true;
+        }
+
+
+        if (try_steal_deque(worker, task)) {
+            run_task(task);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool try_steal_local(Worker& self, Task*& out) {
+        for (auto& worker : workers_) {
+            if (worker.get() == &self) {
+                continue;
+            }
+
+            if (worker->inbox.try_pop(out)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    bool try_steal_deque(Worker& self, Task*& out) {
         for (auto& worker : workers_) {
             if (worker.get() == &self) {
                 continue;
@@ -498,6 +546,21 @@ public:
                 std::forward<F>(f),
                 std::forward<Args>(args)...
             );
+        }
+
+        template <class R>
+        R get(std::future<R>& fut) {
+            while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                if (!pool_->try_run_once(*curr_worker_)) {
+                    std::this_thread::yield();
+                }
+            }
+
+            if constexpr (std::is_void_v<R>) {
+                fut.get();
+            } else {
+                return fut.get();
+            }
         }
     };
 };

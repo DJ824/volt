@@ -2,6 +2,10 @@
 #include <thread_pool/thread_pool.h>
 
 #include <BS_thread_pool_light.hpp>
+#include <oneapi/tbb/global_control.h>
+#include <oneapi/tbb/task_group.h>
+#include <quickpool.hpp>
+#include <thread_pool.hpp>
 #include <chrono>
 #include <concepts>
 #include <cstddef>
@@ -30,42 +34,27 @@ std::size_t benchmark_thread_count() {
 }
 
 template <std::integral DataType, typename FutureProvider>
-    requires std::invocable<FutureProvider, std::vector<DataType>, std::vector<DataType>>
+    requires std::same_as<std::future<void>,
+                          std::invoke_result_t<FutureProvider&, const std::vector<DataType>&,
+                                               const std::vector<DataType>&>>
 void run_benchmark(ankerl::nanobench::Bench* bench, const std::size_t array_size,
                    const std::size_t multiplications_to_perform, const char* name,
                    FutureProvider&& provider) {
-    // generate test data
-    // const auto computations = generate_benchmark_data<int>(array_size,
-    // multiplications_to_perform);
     const std::vector<DataType> a(array_size, 2);
     const std::vector<DataType> b(array_size, 3);
 
-    // set up vector for results
     std::vector<std::future<void>> results;
-
-    if constexpr (!std::is_void_v<std::invoke_result_t<FutureProvider, std::vector<DataType>,
-                                                       std::vector<DataType>>>) {
-        results.reserve(multiplications_to_perform);
-    }
+    results.reserve(multiplications_to_perform);
 
     bench->run(name, [&]() {
-        for (std::size_t i = 0; i < multiplications_to_perform; ++i) {
-            // let std async decide on how to launch the task, either deferred or async
-            if constexpr (std::is_same_v<std::future<void>,
-                                         std::invoke_result_t<FutureProvider, std::vector<DataType>,
-                                                              std::vector<DataType>>>) {
-                results.emplace_back(provider(std::ref(a), std::ref(b)));
+        results.clear();
 
-            } else {
-                provider(std::ref(a), std::ref(b));
-            }
+        for (std::size_t i = 0; i < multiplications_to_perform; ++i) {
+            results.emplace_back(provider(a, b));
         }
 
-        if (!results.empty()) {
-            // wait for futures
-            for (auto& fut : results) {
-                fut.wait();
-            }
+        for (auto& fut : results) {
+            fut.wait();
         }
     });
 }
@@ -106,8 +95,8 @@ int main() {
             pool.start();
             run_benchmark<int>(
                 &bench, array_size, iterations, "volt::ThreadPool",
-                [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                    pool.submit_detached(thread_task, a, b);
+                [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                    return pool.submit(thread_task, std::cref(a), std::cref(b));
                 });
         }
 
@@ -115,8 +104,8 @@ int main() {
             std::cerr << "  dp::thread_pool - std::function\n";
             dp::thread_pool<std::function<void()>> pool{static_cast<unsigned int>(thread_count)};
             run_benchmark<int>(&bench, array_size, iterations, "dp::thread_pool - std::function",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   pool.enqueue_detach(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return pool.enqueue(thread_task, std::cref(a), std::cref(b));
                                });
         }
 
@@ -126,8 +115,8 @@ int main() {
             dp::thread_pool pool{static_cast<unsigned int>(thread_count)};
             run_benchmark<int>(&bench, array_size, iterations,
                                "dp::thread_pool - std::move_only_function",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   pool.enqueue_detach(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return pool.enqueue(thread_task, std::cref(a), std::cref(b));
                                });
         }
 #endif
@@ -136,8 +125,8 @@ int main() {
             dp::thread_pool<fu2::unique_function<void()>> pool{static_cast<unsigned int>(thread_count)};
             run_benchmark<int>(&bench, array_size, iterations,
                                "dp::thread_pool - fu2::unique_function",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   pool.enqueue_detach(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return pool.enqueue(thread_task, std::cref(a), std::cref(b));
                                });
         }
 
@@ -145,8 +134,8 @@ int main() {
             std::cerr << "  BS::thread_pool\n";
             BS::thread_pool_light bs_thread_pool{static_cast<unsigned int>(thread_count)};
             run_benchmark<int>(&bench, array_size, iterations, "BS::thread_pool",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   bs_thread_pool.push_task(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return bs_thread_pool.submit(thread_task, std::cref(a), std::cref(b));
                                });
         }
 
@@ -154,8 +143,8 @@ int main() {
             std::cerr << "  task_thread_pool\n";
             task_thread_pool::task_thread_pool ttp{static_cast<unsigned int>(thread_count)};
             run_benchmark<int>(&bench, array_size, iterations, "task_thread_pool",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   ttp.submit_detach(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return ttp.submit(thread_task, std::cref(a), std::cref(b));
                                });
         }
 
@@ -163,9 +152,49 @@ int main() {
             std::cerr << "  riften::Thiefpool\n";
             riften::Thiefpool riften_thiefpool{thread_count};
             run_benchmark<int>(&bench, array_size, iterations, "riften::Thiefpool",
-                               [&](const std::vector<int>& a, const std::vector<int>& b) -> void {
-                                   riften_thiefpool.enqueue_detach(thread_task, a, b);
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return riften_thiefpool.enqueue(thread_task, std::cref(a), std::cref(b));
                                });
+        }
+
+        {
+            std::cerr << "  quickpool::ThreadPool\n";
+            quickpool::ThreadPool pool{thread_count};
+            run_benchmark<int>(&bench, array_size, iterations, "quickpool::ThreadPool",
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return pool.async(thread_task, std::cref(a), std::cref(b));
+                               });
+        }
+
+        {
+            std::cerr << "  HQarroum::thread_pool\n";
+            thread::pool::pool_t pool{thread_count};
+            run_benchmark<int>(&bench, array_size, iterations, "HQarroum::thread_pool",
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   return pool.schedule(thread_task, std::cref(a), std::cref(b));
+                               });
+        }
+
+        {
+            std::cerr << "  oneTBB task_group\n";
+            oneapi::tbb::global_control control{
+                oneapi::tbb::global_control::max_allowed_parallelism, thread_count};
+            oneapi::tbb::task_group group;
+            run_benchmark<int>(&bench, array_size, iterations, "oneTBB task_group",
+                               [&](const std::vector<int>& a, const std::vector<int>& b) -> std::future<void> {
+                                   auto promise = std::make_shared<std::promise<void>>();
+                                   auto future = promise->get_future();
+                                   group.run([promise, &thread_task, &a, &b] {
+                                       try {
+                                           thread_task(a, b);
+                                           promise->set_value();
+                                       } catch (...) {
+                                           promise->set_exception(std::current_exception());
+                                       }
+                                   });
+                                   return future;
+                               });
+            group.wait();
         }
 
         std::cerr << "finished matrix multiplication " << array_size << "x" << array_size << "\n";
