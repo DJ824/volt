@@ -11,7 +11,7 @@
 #include <immintrin.h>
 
 #ifndef CACHE_LINE_SIZE
-#define CACHE_LINE_SIZE 64
+#define CACHE_LINE_SIZE 128
 #endif
 
 template <typename T, size_t SIZE>

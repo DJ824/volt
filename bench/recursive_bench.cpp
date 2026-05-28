@@ -68,23 +68,6 @@ void serial_sort(std::vector<int>& values, std::size_t lo, std::size_t hi) {
               values.begin() + static_cast<std::ptrdiff_t>(hi));
 }
 
-void volt_merge_sort(ThreadPool::TaskContext& ctx, std::vector<int>& values,
-                     std::vector<int>& scratch, std::size_t lo, std::size_t hi,
-                     std::size_t cutoff, std::size_t depth) {
-    if (hi - lo <= cutoff || depth == 0) {
-        serial_sort(values, lo, hi);
-        return;
-    }
-
-    const std::size_t mid = lo + (hi - lo) / 2;
-    auto left = ctx.spawn_returning_ctx(volt_merge_sort, std::ref(values), std::ref(scratch),
-                                        lo, mid, cutoff, depth - 1);
-
-    volt_merge_sort(ctx, values, scratch, mid, hi, cutoff, depth - 1);
-    ctx.get(left);
-    merge_range(values, scratch, lo, mid, hi);
-}
-
 template <typename Pool, typename Submit>
 void future_merge_sort(Pool& pool, Submit& submit, std::vector<int>& values,
                        std::vector<int>& scratch, std::size_t lo, std::size_t hi,
@@ -150,7 +133,7 @@ int main() {
 
         {
             std::cerr << "  volt::ThreadPool\n";
-            ThreadPool pool{thread_count};
+            volt::ThreadPool pool{thread_count};
             pool.start();
             auto submit = [&](auto&& task) {
                 return pool.submit(std::forward<decltype(task)>(task));
