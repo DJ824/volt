@@ -20,6 +20,15 @@
 #include "workers.h"
 
 namespace volt {
+
+    static constexpr uint64_t done_bit = 1;
+    static constexpr uint64_t gen_mask = ~done_bit;
+
+    // gen 2 = 0010
+    // gen 3 = 0011
+
+    // gen = 0011 & 1110 = 0010
+
     class ThreadPool {
     public:
         class TaskContext;
@@ -228,6 +237,7 @@ namespace volt {
         std::atomic<bool> stopping_{false};
         std::atomic<size_t> submit_cursor_{0};
         std::atomic<size_t> pending_tasks_{0};
+        std::atomic<uint64_t> stack_gen_{0};
 
         void run_heap_task(HeapTask* task) noexcept {
             task->run(task);
@@ -498,8 +508,26 @@ namespace volt {
             curr_worker_ = &worker;
 
             while (!stopping_.load(std::memory_order_acquire) || pending_tasks_.load(std::memory_order_acquire) != 0) {
-                HeapTask* task = nullptr;
                 StackTask* stack_task = nullptr;
+
+                uint64_t worker_gen = worker.gen.load();
+                // 0010
+                // 1110
+                // 0010
+
+                uint64_t curr_task_gen = worker_gen & gen_mask;
+                bool done = (worker_gen & done_bit) != 0;
+
+                if (curr_task_gen != 0 && curr_task_gen != worker.last_task_gen && !done) {
+                    worker.last_task_gen = curr_task_gen;
+                    stack_task = worker.stack_task;
+                    run_stack_task(stack_task);
+                    worker.gen.store(curr_task_gen | done_bit, std::memory_order_release);
+                    continue;
+                }
+
+
+                HeapTask* task = nullptr;
 
                 if (worker.deque.try_pop_bottom(task)) {
                     run_heap_task(task);

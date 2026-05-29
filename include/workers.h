@@ -33,6 +33,10 @@ namespace volt {
             using LocalDeque = WorkStealDeque<HeapTask*, kLocalQueueSize>;
             using StackDeque = WorkStealDeque<StackTask*, kLocalQueueSize>;
 
+            alignas(128) std::atomic<uint64_t> gen{0};
+            StackTask* stack_task{nullptr};
+            uint64_t last_task_gen{0};
+
             ThreadPool* pool{nullptr};
             uint64_t id{0};
             Inbox inbox;
