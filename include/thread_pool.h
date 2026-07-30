@@ -1,713 +1,945 @@
 #pragma once
 #define VOLT_THREAD_POOL_H
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <future>
-#include <atomic>
-#include <cstdint>
+#include <iostream>
+#include <iterator>
 #include <memory>
+#include <new>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <new>
-#include <thread>
-#ifdef __linux__
-#include <pthread.h>
-#include <sched.h>
+
+#include <immintrin.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
+#include <Windows.h>
+#endif
+
 #include "workers.h"
 
-namespace volt {
+namespace volt
+{
 
-    static constexpr uint64_t done_bit = 1;
-    static constexpr uint64_t gen_mask = ~done_bit;
+class ThreadPool
+{
+public:
+   class TaskContext;
 
-    // gen 2 = 0010
-    // gen 3 = 0011
+private:
+   using HeapTask   = details::HeapTask;
+   using Worker     = details::Worker;
+   using InboxToken = typename Worker::Inbox::ConsumerToken;
 
-    // gen = 0011 & 1110 = 0010
+   int ct = 0;
 
-    class ThreadPool {
-    public:
-        class TaskContext;
+   template<class F, class... Args>
+   struct DetachedTask : HeapTask
+   {
+      std::decay_t<F>                   mFunc;
+      std::tuple<std::decay_t<Args>...> mArgs;
 
-    private:
-        using HeapTask = details::HeapTask;
-        using StackTask = details::StackTask;
-        using Worker = details::Worker;
-
-        template <class F>
-        struct ParallelForTask;
-
-        template <class F>
-        static void run_parallel_for_task(StackTask* base) noexcept;
-
-        template <class F>
-        static void finish_parallel_for_task(StackTask* base) noexcept;
+      DetachedTask(void (*destroyFn)(HeapTask*) noexcept, F&& f, Args&&... args)
+         : HeapTask{&runImpl, destroyFn}
+         , mFunc{std::forward<F>(f)}
+         , mArgs{std::forward<Args>(args)...}
+      {}
 
 
-        template <class F, class... Args>
-        struct DetachedTask : HeapTask {
-            std::decay_t<F> func;
-            std::tuple<std::decay_t<Args>...> args;
+      static void runImpl(HeapTask* base) noexcept
+      {
+         auto self = static_cast<DetachedTask*>(base);
+         std::apply(self->mFunc, self->mArgs);
+      }
+   };
 
-            DetachedTask(void (*destroy_fn)(HeapTask*) noexcept, F&& f, Args&&... args)
-                : HeapTask{&run_impl, destroy_fn},
-                  func{std::forward<F>(f)}, args{std::forward<Args>(args)...} {
+   template<class F, class... Args>
+   struct DetachedContextTask : HeapTask
+   {
+      ThreadPool*                       mPool;
+      std::decay_t<F>                   mFunc;
+      std::tuple<std::decay_t<Args>...> mArgs;
+
+      DetachedContextTask(void (*destroyFn)(HeapTask*) noexcept, ThreadPool* p, F&& f, Args&&... args)
+         : HeapTask{&runImpl, destroyFn}
+         , mPool(p)
+         , mFunc(std::forward<F>(f))
+         , mArgs(std::forward<Args>(args)...)
+      {}
+
+      static void runImpl(HeapTask* base) noexcept
+      {
+         auto self = static_cast<DetachedContextTask*>(base);
+
+         TaskContext ctx{self->mPool};
+         std::apply([&](auto&&... unpacked) { self->mFunc(ctx, std::forward<decltype(unpacked)>(unpacked)...); },
+                    self->mArgs);
+      }
+   };
+
+   template<class F, class... Args>
+   struct ReturningTask : HeapTask
+   {
+      using R = std::invoke_result_t<F, Args...>;
+
+      std::decay_t<F>                   mFunc;
+      std::tuple<std::decay_t<Args>...> mArgs;
+      std::promise<R>                   mPromise;
+
+      ReturningTask(void (*destroyFn)(HeapTask*) noexcept, F&& f, Args&&... args)
+         : HeapTask{&runImpl, destroyFn}
+         , mFunc{std::forward<F>(f)}
+         , mArgs{std::forward<Args>(args)...}
+      {}
+
+      static void runImpl(HeapTask* base) noexcept
+      {
+         auto* self = static_cast<ReturningTask*>(base);
+         try
+         {
+            if constexpr (std::is_void_v<R>)
+            {
+               std::apply(self->mFunc, self->mArgs);
+               self->mPromise.set_value();
             }
-
-
-            static void run_impl(HeapTask* base) noexcept {
-                auto self = static_cast<DetachedTask*>(base);
-                std::apply(self->func, self->args);
+            else
+            {
+               self->mPromise.set_value(std::apply(self->mFunc, self->mArgs));
             }
-        };
+         }
+         catch (...)
+         {
+            self->mPromise.set_exception(std::current_exception());
+         }
+      }
+   };
 
-        template <class F, class... Args>
-        struct DetachedContextTask : HeapTask {
-            ThreadPool* pool;
-            std::decay_t<F> func;
-            std::tuple<std::decay_t<Args>...> args;
+   template<class F, class... Args>
+   struct ReturningContextTask : HeapTask
+   {
+      using R = std::invoke_result_t<F, TaskContext&, Args...>;
+      ThreadPool*                       mPool;
+      std::decay_t<F>                   mFunc;
+      std::tuple<std::decay_t<Args>...> mArgs;
+      std::promise<R>                   mPromise;
 
-            DetachedContextTask(void (*destroy_fn)(HeapTask*) noexcept, ThreadPool* p, F&& f, Args&&... args)
-                : HeapTask{&run_impl, destroy_fn},
-                  pool(p),
-                  func(std::forward<F>(f)),
-                  args(std::forward<Args>(args)...) {
+      ReturningContextTask(void (*destroyFn)(HeapTask*) noexcept, ThreadPool* p, F&& f, Args&&... args)
+         : HeapTask{&runImpl, destroyFn}
+         , mPool(p)
+         , mFunc(std::forward<F>(f))
+         , mArgs(std::forward<Args>(args)...)
+      {}
+
+      static void runImpl(HeapTask* base) noexcept
+      {
+         auto self = static_cast<ReturningContextTask*>(base);
+
+         try
+         {
+            TaskContext ctx{self->mPool};
+
+            if constexpr (std::is_void_v<R>)
+            {
+               std::apply([&](auto&&... unpacked) { self->mFunc(ctx, std::forward<decltype(unpacked)>(unpacked)...); },
+                          self->mArgs);
+               self->mPromise.set_value();
             }
+            else
+               self->mPromise.set_value(
+                  std::apply([&](auto&&... unpacked)
+                             { return self->mFunc(ctx, std::forward<decltype(unpacked)>(unpacked)...); },
+                             self->mArgs));
+         }
+         catch (...)
+         {
+            self->mPromise.set_exception(std::current_exception());
+         }
+      }
+   };
 
-            static void run_impl(HeapTask* base) noexcept {
-                auto self = static_cast<DetachedContextTask*>(base);
+   template<class T>
+   static void heapDestroy(HeapTask* base) noexcept
+   {
+      delete static_cast<T*>(base);
+   }
 
-                try {
-                    TaskContext ctx{self->pool};
-                    std::apply([&](auto&&... unpacked) {
-                        self->func(ctx, std::forward<decltype(unpacked)>(unpacked)...);
-                    }, self->args);
-                }
-                catch (...) {
-                    std::terminate();
-                }
+   template<class T>
+   static void pooledDestroy(HeapTask* base) noexcept
+   {
+      auto* self    = static_cast<T*>(base);
+      void* storage = self;
+      self->~T();
+      mCurrentWorker->freeList.release(storage);
+   }
+
+   template<class T, class... Args>
+   T* makeTask(TaskFreeList* freeList, Args&&... args)
+   {
+      if constexpr (sizeof(T) <= TaskFreeList::block_size() && alignof(T) <= TaskFreeList::block_align())
+      {
+         if (freeList != nullptr)
+         {
+            void* storage = freeList->acquire();
+            return new (storage) T(&pooledDestroy<T>, std::forward<Args>(args)...);
+         }
+      }
+
+      return new T(&heapDestroy<T>, std::forward<Args>(args)...);
+   }
+
+   template<class F, class... Args>
+   auto makeReturningTask(TaskFreeList* freeList, F&& f, Args&&... args)
+   {
+      using T = ReturningTask<F, Args...>;
+      using R = typename T::R;
+
+      auto* task = makeTask<T>(freeList, std::forward<F>(f), std::forward<Args>(args)...);
+
+      std::future<R> future = task->mPromise.get_future();
+      return std::pair<HeapTask*, std::future<R>>{task, std::move(future)};
+   }
+
+   template<class F, class... Args>
+   auto makeReturningSpawningTask(TaskFreeList* freeList, F&& f, Args&&... args)
+   {
+      using T = ReturningContextTask<F, Args...>;
+      using R = typename T::R;
+
+      auto*          task   = makeTask<T>(freeList, this, std::forward<F>(f), std::forward<Args>(args)...);
+      std::future<R> future = task->mPromise.get_future();
+      return std::pair<HeapTask*, std::future<R>>{task, std::move(future)};
+   }
+
+   template<class F, class... Args>
+   auto makeDetachedTask(TaskFreeList* freeList, F&& f, Args&&... args)
+   {
+      using T = DetachedTask<F, Args...>;
+
+      return makeTask<T>(freeList, std::forward<F>(f), std::forward<Args>(args)...);
+   }
+
+   template<class F, class... Args>
+   auto makeDetachedSpawningTask(TaskFreeList* freeList, F&& f, Args&&... args)
+   {
+      using T = DetachedContextTask<F, Args...>;
+
+      return makeTask<T>(freeList, this, std::forward<F>(f), std::forward<Args>(args)...);
+   }
+
+
+   inline static thread_local Worker* mCurrentWorker = nullptr;
+
+   bool                                 mStarted{false};
+   std::size_t                          mThreadCount{0};
+   std::vector<std::unique_ptr<Worker>> mWorkers;
+
+   std::vector<std::vector<InboxToken>> mInboxTokens;
+
+   std::atomic<bool>        mStopping{false};
+   std::size_t              mSubmitCursor{0};
+   std::atomic<std::size_t> mPendingTasks{0};
+
+   std::vector<std::uint32_t> mWorkerCpuSetIds;
+   TaskFreeList               mGlobalFreeList;
+
+   void runHeapTask(HeapTask* task) noexcept
+   {
+      task->run(task);
+      task->destroy(task);
+
+      const auto previous = mPendingTasks.fetch_sub(1, std::memory_order_release);
+
+      if (previous == 1 && mStopping.load(std::memory_order_acquire))
+      {
+         wakeAllWorkers();
+      }
+   }
+
+   void wakeAllWorkers() noexcept
+   {
+      for (auto& worker : mWorkers)
+      {
+         worker->wakeSequence.fetch_add(1, std::memory_order_release);
+
+         worker->wakeSequence.notify_one();
+      }
+   }
+
+   [[nodiscard]]
+   static std::size_t defaultThreadCount() noexcept
+   {
+      const auto count = std::thread::hardware_concurrency();
+      return count == 0 ? 1 : static_cast<std::size_t>(count);
+   }
+
+#ifdef _WIN32
+   struct CpuSetDescriptor
+   {
+      std::uint32_t mId{0};
+      std::uint16_t mGroup{0};
+      std::uint8_t  mLogicalProcessor{0};
+      std::uint8_t  mCore{0};
+      std::uint8_t  mEfficiencyClass{0};
+   };
+
+   struct CpuCoreDescriptor
+   {
+      std::uint16_t                 mGroup{0};
+      std::uint8_t                  mCore{0};
+      std::uint8_t                  mEfficiencyClass{0};
+      std::vector<CpuSetDescriptor> mLogicalProcessors;
+   };
+
+   [[nodiscard]]
+   static std::vector<CpuSetDescriptor> queryCpuSets()
+   {
+      ULONG requiredSize = 0;
+
+      static_cast<void>(GetSystemCpuSetInformation(nullptr, 0, &requiredSize, GetCurrentProcess(), 0));
+
+      if (requiredSize == 0)
+      {
+         return {};
+      }
+
+      std::vector<std::byte> buffer(requiredSize);
+      ULONG                  returnedSize = requiredSize;
+
+      if (GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                                     requiredSize,
+                                     &returnedSize,
+                                     GetCurrentProcess(),
+                                     0) == FALSE)
+      {
+         return {};
+      }
+
+      std::vector<CpuSetDescriptor> result;
+      std::size_t                   offset = 0;
+
+      while (offset < returnedSize)
+      {
+         const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+
+         if (info->Size == 0 || offset + info->Size > returnedSize)
+         {
+            break;
+         }
+
+         if (info->Type == CpuSetInformation)
+         {
+            const auto& cpu = info->CpuSet;
+
+            if (!(cpu.Allocated && !cpu.AllocatedToTargetProcess))
+            {
+               result.push_back(CpuSetDescriptor{static_cast<std::uint32_t>(cpu.Id),
+                                                 static_cast<std::uint16_t>(cpu.Group),
+                                                 static_cast<std::uint8_t>(cpu.LogicalProcessorIndex),
+                                                 static_cast<std::uint8_t>(cpu.CoreIndex),
+                                                 static_cast<std::uint8_t>(cpu.EfficiencyClass)});
             }
-        };
+         }
 
-        template <class F, class... Args>
-        struct ReturningTask : HeapTask {
-            using R = std::invoke_result_t<F, Args...>;
+         offset += info->Size;
+      }
 
-            std::decay_t<F> func;
-            std::tuple<std::decay_t<Args>...> args;
-            std::promise<R> promise;
+      return result;
+   }
 
-            ReturningTask(void (*destroy_fn)(HeapTask*) noexcept, F&& f, Args&&... args)
-                : HeapTask{&run_impl, destroy_fn},
-                  func{std::forward<F>(f)}, args{std::forward<Args>(args)...} {
-            }
+   [[nodiscard]]
+   static std::vector<CpuCoreDescriptor> groupCpuSetsByCore(std::vector<CpuSetDescriptor> cpuSets)
+   {
+      std::sort(cpuSets.begin(),
+                cpuSets.end(),
+                [](const CpuSetDescriptor& lhs, const CpuSetDescriptor& rhs)
+                {
+                   if (lhs.mEfficiencyClass != rhs.mEfficiencyClass)
+                   {
+                      return lhs.mEfficiencyClass > rhs.mEfficiencyClass;
+                   }
 
-            static void run_impl(HeapTask* base) noexcept {
-                auto* self = static_cast<ReturningTask*>(base);
-                try {
-                    if constexpr (std::is_void_v<R>) {
-                        std::apply(self->func, self->args);
-                        self->promise.set_value();
-                    }
-                    else {
-                        self->promise.set_value(std::apply(self->func, self->args));
-                    }
-                }
-                catch (...) {
-                    self->promise.set_exception(std::current_exception());
-                }
-            }
-        };
+                   if (lhs.mGroup != rhs.mGroup)
+                   {
+                      return lhs.mGroup < rhs.mGroup;
+                   }
 
-        template <class F, class... Args>
-        struct ReturningContextTask : HeapTask {
-            using R = std::invoke_result_t<F, TaskContext&, Args...>;
-            ThreadPool* pool;
-            std::decay_t<F> func;
-            std::tuple<std::decay_t<Args>...> args;
-            std::promise<R> promise;
+                   if (lhs.mCore != rhs.mCore)
+                   {
+                      return lhs.mCore < rhs.mCore;
+                   }
 
-            ReturningContextTask(void (*destroy_fn)(HeapTask*) noexcept, ThreadPool* p, F&& f, Args&&... args)
-                : HeapTask{&run_impl, destroy_fn},
-                  pool(p),
-                  func(std::forward<F>(f)),
-                  args(std::forward<Args>(args)...) {
-            }
-
-            static void run_impl(HeapTask* base) noexcept {
-                auto self = static_cast<ReturningContextTask*>(base);
-
-                try {
-                    TaskContext ctx{self->pool};
-
-                    if constexpr (std::is_void_v<R>) {
-                        std::apply([&](auto&&... unpacked) {
-                            self->func(ctx, std::forward<decltype(unpacked)>(unpacked)...);
-                        }, self->args);
-                        self->promise.set_value();
-                    }
-                    else
-                        self->promise.set_value(std::apply([&](auto&&... unpacked) {
-                            return self->func(ctx, std::forward<decltype(unpacked)>(unpacked)...);
-                        }, self->args));
-                }
-                catch (...) {
-                    self->promise.set_exception(std::current_exception());
-                }
-            }
-        };
-
-        template <class T>
-        static void heap_destroy(HeapTask* base) noexcept {
-            delete static_cast<T*>(base);
-        }
-
-        template <class T>
-        static void pooled_destroy(HeapTask* base) noexcept {
-            auto* self = static_cast<T*>(base);
-            void* storage = self;
-            self->~T();
-            curr_worker_->free_list.release(storage);
-        }
-
-        template <class T, class... Args>
-        T* make_task(TaskFreeList* free_list, Args&&... args) {
-            if constexpr (sizeof(T) <= TaskFreeList::block_size() &&
-                alignof(T) <= TaskFreeList::block_align()) {
-                if (free_list != nullptr) {
-                    void* storage = free_list->acquire();
-                    try {
-                        return new(storage) T(&pooled_destroy<T>, std::forward<Args>(args)...);
-                    }
-                    catch (...) {
-                        free_list->release(storage);
-                        // log err
-                        throw;
-                    }
-                }
-            }
-
-            return new T(&heap_destroy<T>, std::forward<Args>(args)...);
-        }
-
-        template <class F, class... Args>
-        auto make_returning_task(TaskFreeList* free_list, F&& f, Args&&... args) {
-            using T = ReturningTask<F, Args...>;
-            using R = typename T::R;
-
-            auto* task = make_task<T>(free_list, std::forward<F>(f), std::forward<Args>(args)...);
-
-            std::future<R> future = task->promise.get_future();
-            return std::pair<HeapTask*, std::future<R>>{task, std::move(future)};
-        }
-
-        template <class F, class... Args>
-        auto make_returning_spawning_task(TaskFreeList* free_list, F&& f, Args&&... args) {
-            using T = ReturningContextTask<F, Args...>;
-            using R = typename T::R;
-
-            auto* task = make_task<T>(free_list, this, std::forward<F>(f), std::forward<Args>(args)...);
-            std::future<R> future = task->promise.get_future();
-            return std::pair<HeapTask*, std::future<R>>{task, std::move(future)};
-        }
-
-        template <class F, class... Args>
-        auto make_detached_task(TaskFreeList* free_list, F&& f, Args&&... args) {
-            using T = DetachedTask<F, Args...>;
-
-            return make_task<T>(free_list, std::forward<F>(f), std::forward<Args>(args)...);
-        }
-
-        template <class F, class... Args>
-        auto make_detached_spawning_task(TaskFreeList* free_list, F&& f, Args&&... args) {
-            using T = DetachedContextTask<F, Args...>;
-
-            return make_task<T>(free_list, this, std::forward<F>(f), std::forward<Args>(args)...);
-        }
-
-
-        inline static thread_local Worker* curr_worker_ = nullptr;
-        bool started_{false};
-        uint64_t thread_count_;
-        std::vector<std::unique_ptr<Worker>> workers_;
-        std::atomic<bool> stopping_{false};
-        std::atomic<size_t> submit_cursor_{0};
-        std::atomic<size_t> pending_tasks_{0};
-        std::atomic<uint64_t> stack_gen_{0};
-
-        void run_heap_task(HeapTask* task) noexcept {
-            task->run(task);
-            task->destroy(task);
-
-            const auto previous = pending_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-
-            if (previous == 1 && stopping_.load(std::memory_order_acquire)) {
-                wake_all_workers();
-            }
-        }
-
-        void run_stack_task(StackTask* task) noexcept {
-            task->run(task);
-            task->finish(task);
-        }
-
-        void wake_all_workers() noexcept {
-            for (auto& worker : workers_) {
-                // worker->wake_word.fetch_add(1, std::memory_order_release);
-                // futex_wake(worker->wake_word, 1);
-                worker->signal.release();
-            }
-        }
-
-        [[nodiscard]] static uint64_t default_thread_count() noexcept {
-#ifdef __linux__
-            cpu_set_t allowed;
-            CPU_ZERO(&allowed);
-
-            if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
-                uint64_t count = 0;
-                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-                    if (CPU_ISSET(cpu, &allowed)) {
-                        ++count;
-                    }
-                }
-
-                if (count != 0) {
-                    return count;
-                }
-            }
-#endif
-
-            const auto count = std::thread::hardware_concurrency();
-            return count == 0 ? 1 : count;
-        }
-
-        static void pin_current_thread(uint64_t worker_id) noexcept {
-#ifdef __linux__
-            cpu_set_t allowed;
-            CPU_ZERO(&allowed);
-
-            if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-                return;
-            }
-
-            uint64_t allowed_count = 0;
-            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-                if (CPU_ISSET(cpu, &allowed)) {
-                    ++allowed_count;
-                }
-            }
-
-            if (allowed_count == 0) {
-                return;
-            }
-
-            const uint64_t target_index = worker_id % allowed_count;
-            uint64_t seen = 0;
-            int target_cpu = -1;
-            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-                if (!CPU_ISSET(cpu, &allowed)) {
-                    continue;
-                }
-
-                if (seen == target_index) {
-                    target_cpu = cpu;
-                    break;
-                }
-
-                ++seen;
-            }
-
-            if (target_cpu < 0) {
-                return;
-            }
-
-            cpu_set_t target;
-            CPU_ZERO(&target);
-            CPU_SET(target_cpu, &target);
-            static_cast<void>(pthread_setaffinity_np(pthread_self(), sizeof(target), &target));
-#else
-            static_cast<void>(worker_id);
-#endif
-        }
-
-        void enqueue_stack_task(size_t worker_idx, StackTask* task) noexcept {
-            auto worker = workers_[worker_idx].get();
-
-            worker->stack_inbox.enqueue(task);
-            worker->signal.release();
-        }
-
-    public:
-        ThreadPool() : ThreadPool(default_thread_count()) {
-        }
-
-        explicit ThreadPool(size_t thread_ct) {
-            workers_.reserve(thread_ct);
-
-            for (size_t i = 0; i < thread_ct; i++) {
-                auto worker = std::make_unique<Worker>();
-                worker->pool = this;
-                worker->id = i;
-                workers_.push_back(std::move(worker));
-            }
-
-            thread_count_ = thread_ct;
-        }
-
-        ~ThreadPool() {
-            stop();
-            join();
-        }
-
-        void start() {
-            if (started_) {
-                return;
-            }
-
-            started_ = true;
-
-            for (auto& worker : workers_) {
-                auto worker_ptr = worker.get();
-                worker->thread = std::thread([this, worker_ptr] {
-                    // pin_current_thread(worker_ptr->id);
-                    worker_loop(*worker_ptr);
+                   return lhs.mLogicalProcessor < rhs.mLogicalProcessor;
                 });
+
+      std::vector<CpuCoreDescriptor> cores;
+
+      for (const CpuSetDescriptor& cpu : cpuSets)
+      {
+         auto coreIt = std::find_if(cores.begin(),
+                                    cores.end(),
+                                    [&](const CpuCoreDescriptor& core)
+                                    { return core.mGroup == cpu.mGroup && core.mCore == cpu.mCore; });
+
+         if (coreIt == cores.end())
+         {
+            cores.push_back(CpuCoreDescriptor{cpu.mGroup, cpu.mCore, cpu.mEfficiencyClass, {}});
+
+            coreIt = std::prev(cores.end());
+         }
+
+         coreIt->mLogicalProcessors.push_back(cpu);
+      }
+
+      return cores;
+   }
+
+   [[nodiscard]]
+   static std::vector<std::uint8_t> efficiencyClassesDescending(const std::vector<CpuCoreDescriptor>& cores)
+   {
+      std::vector<std::uint8_t> classes;
+      classes.reserve(cores.size());
+
+      for (const CpuCoreDescriptor& core : cores)
+      {
+         if (std::find(classes.begin(), classes.end(), core.mEfficiencyClass) == classes.end())
+         {
+            classes.push_back(core.mEfficiencyClass);
+         }
+      }
+
+      std::sort(classes.begin(), classes.end(), std::greater<>{});
+      return classes;
+   }
+
+   static void appendPrimaryLogicalProcessors(const std::vector<CpuCoreDescriptor>& cores,
+                                              std::uint8_t                          efficiencyClass,
+                                              std::vector<std::uint32_t>&           output)
+   {
+      for (const CpuCoreDescriptor& core : cores)
+      {
+         if (core.mEfficiencyClass == efficiencyClass && !core.mLogicalProcessors.empty())
+         {
+            output.push_back(core.mLogicalProcessors.front().mId);
+         }
+      }
+   }
+
+   static void appendSmtSiblings(const std::vector<CpuCoreDescriptor>& cores,
+                                 std::uint8_t                          efficiencyClass,
+                                 std::vector<std::uint32_t>&           output)
+   {
+      for (const CpuCoreDescriptor& core : cores)
+      {
+         if (core.mEfficiencyClass != efficiencyClass)
+         {
+            continue;
+         }
+
+         for (std::size_t logical = 1; logical < core.mLogicalProcessors.size(); ++logical)
+         {
+            output.push_back(core.mLogicalProcessors[logical].mId);
+         }
+      }
+   }
+
+   [[nodiscard]]
+   static std::vector<std::uint32_t> buildWorkerCpuSetOrder() noexcept
+   {
+      try
+      {
+         auto cores = groupCpuSetsByCore(queryCpuSets());
+
+         if (cores.empty())
+         {
+            return {};
+         }
+
+         const auto classes = efficiencyClassesDescending(cores);
+
+         if (classes.empty())
+         {
+            return {};
+         }
+
+         std::vector<std::uint32_t> order;
+
+         std::size_t logicalProcessorCount = 0;
+         for (const CpuCoreDescriptor& core : cores)
+         {
+            logicalProcessorCount += core.mLogicalProcessors.size();
+         }
+         order.reserve(logicalProcessorCount);
+
+         appendPrimaryLogicalProcessors(cores, classes.front(), order);
+
+         if (classes.size() >= 2)
+         {
+            appendPrimaryLogicalProcessors(cores, classes[1], order);
+         }
+
+         appendSmtSiblings(cores, classes.front(), order);
+
+         for (std::size_t classIndex = 2; classIndex < classes.size(); ++classIndex)
+         {
+            appendPrimaryLogicalProcessors(cores, classes[classIndex], order);
+         }
+
+         for (std::size_t classIndex = 1; classIndex < classes.size(); ++classIndex)
+         {
+            appendSmtSiblings(cores, classes[classIndex], order);
+         }
+
+         return order;
+      }
+      catch (...)
+      {
+         return {};
+      }
+   }
+#endif
+
+   void pinCurrentThread(std::size_t workerId) const noexcept
+   {
+#ifdef _WIN32
+      if (workerId >= mWorkerCpuSetIds.size())
+      {
+         return;
+      }
+
+      const ULONG cpuSetId = static_cast<ULONG>(mWorkerCpuSetIds[workerId]);
+
+      static_cast<void>(SetThreadSelectedCpuSets(GetCurrentThread(), &cpuSetId, 1));
+#else
+      static_cast<void>(workerId);
+#endif
+   }
+
+   [[nodiscard]]
+   bool tryPopInbox(Worker& consumer, Worker& source, HeapTask*& task) noexcept
+   {
+      const auto consumerId = static_cast<std::size_t>(consumer.id);
+      const auto sourceId   = static_cast<std::size_t>(source.id);
+
+      return source.inbox.tryPop(mInboxTokens[consumerId][sourceId], task);
+   }
+
+   void enqueueExternal(std::size_t workerId, HeapTask* task)
+   {
+      Worker& worker = *mWorkers[workerId];
+
+      worker.inbox.push(task);
+
+      worker.wakeSequence.fetch_add(1, std::memory_order_release);
+
+      worker.wakeSequence.notify_one();
+   }
+
+   void enqueueExternal(HeapTask* task)
+   {
+      auto threadId = mSubmitCursor++ % mThreadCount;
+      enqueueExternal(threadId, task);
+   }
+
+public:
+   ThreadPool()
+      : ThreadPool(2)
+   {}
+
+   explicit ThreadPool(std::size_t threadCount)
+      : mThreadCount{std::max<std::size_t>(1, threadCount)}
+   {
+#ifdef _WIN32
+      mWorkerCpuSetIds = buildWorkerCpuSetOrder();
+#endif
+
+      mWorkers.reserve(mThreadCount);
+
+      for (std::size_t i = 0; i < mThreadCount; ++i)
+      {
+         auto worker        = std::make_unique<Worker>();
+         worker->pool       = this;
+         worker->id         = i;
+         worker->nextVictim = (i + 1) % mThreadCount;
+         mWorkers.push_back(std::move(worker));
+      }
+
+      mInboxTokens.reserve(mThreadCount);
+
+      for (std::size_t consumer = 0; consumer < mThreadCount; ++consumer)
+      {
+         mInboxTokens.emplace_back();
+         auto& tokens = mInboxTokens.back();
+         tokens.reserve(mThreadCount);
+
+         for (std::size_t source = 0; source < mThreadCount; ++source)
+         {
+            tokens.emplace_back(mWorkers[source]->inbox.makeConsumerToken());
+         }
+      }
+
+      mGlobalFreeList.allocate_chunk();
+   }
+
+   ~ThreadPool()
+   {
+      stop();
+      join();
+   }
+
+   void start()
+   {
+      if (mStarted)
+      {
+         return;
+      }
+
+      mStarted = true;
+
+      for (auto& worker : mWorkers)
+      {
+         auto workerPtr = worker.get();
+         worker->thread = std::thread(
+            [this, workerPtr]
+            {
+               pinCurrentThread(static_cast<std::size_t>(workerPtr->id));
+               workerLoop(*workerPtr);
+            });
+      }
+   }
+
+   template<class F, class... Args>
+   auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>>
+   {
+      auto  workerId      = mSubmitCursor++ % mThreadCount;
+      auto* worker        = mWorkers[workerId].get();
+      auto [task, future] = makeReturningTask(&mGlobalFreeList, std::forward<F>(f), std::forward<Args>(args)...);
+      mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+      enqueueExternal(workerId, task);
+      return std::move(future);
+   }
+
+   template<class F, class... Args>
+   auto submitDetached(F&& f, Args&&... args)
+   {
+      const auto workerId = mSubmitCursor++ % mThreadCount;
+      HeapTask*  task     = makeDetachedTask(&mGlobalFreeList, std::forward<F>(f), std::forward<Args>(args)...);
+      mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+      enqueueExternal(workerId, task);
+   }
+
+   template<class F, class... Args>
+   auto submitDetachedCtx(F&& f, Args&&... args)
+   {
+      auto      workerId = mSubmitCursor++ % mThreadCount;
+      auto*     worker   = mWorkers[workerId].get();
+      HeapTask* task     = makeDetachedSpawningTask(&mGlobalFreeList, std::forward<F>(f), std::forward<Args>(args)...);
+
+      mPendingTasks.fetch_add(1, std::memory_order_seq_cst);
+      enqueueExternal(workerId, task);
+   }
+
+   template<class F, class... Args>
+   auto spawnDetached(F&& f, Args&&... args)
+   {
+      if (mCurrentWorker && mCurrentWorker->pool == this)
+      {
+         HeapTask* task = makeDetachedTask(&mCurrentWorker->freeList, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+         mCurrentWorker->local.pushBottom(task);
+         wakeAllWorkers();
+      }
+      else
+      {
+         HeapTask* task = makeDetachedTask(&mGlobalFreeList, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+         enqueueExternal(task);
+      }
+   }
+
+   template<class F, class... Args>
+   auto spawnDetachedCtx(F&& f, Args&&... args)
+   {
+      if (mCurrentWorker && mCurrentWorker->pool == this)
+      {
+         HeapTask* task =
+            makeDetachedSpawningTask(&mCurrentWorker->freeList, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+         mCurrentWorker->local.pushBottom(task);
+         wakeAllWorkers();
+      }
+      else
+      {
+         HeapTask* task = makeDetachedSpawningTask(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_relaxed);
+         enqueueExternal(task);
+      }
+   }
+
+   template<class F, class... Args>
+   auto spawnReturning(F&& f, Args&&... args)
+   {
+      if (mCurrentWorker && mCurrentWorker->pool == this)
+      {
+         auto [task, future] =
+            makeReturningTask(&mCurrentWorker->freeList, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_seq_cst);
+         mCurrentWorker->local.pushBottom(task);
+         wakeAllWorkers();
+         return std::move(future);
+      }
+
+      auto [task, future] = makeReturningTask(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
+      mPendingTasks.fetch_add(1, std::memory_order_seq_cst);
+      enqueueExternal(task);
+      return std::move(future);
+   }
+
+   template<class F, class... Args>
+   auto spawnReturningCtx(F&& f, Args&&... args)
+   {
+      if (mCurrentWorker && mCurrentWorker->pool == this)
+      {
+         auto [task, future] =
+            makeReturningSpawningTask(&mCurrentWorker->freeList, std::forward<F>(f), std::forward<Args>(args)...);
+         mPendingTasks.fetch_add(1, std::memory_order_seq_cst);
+         mCurrentWorker->local.pushBottom(task);
+         wakeAllWorkers();
+         return std::move(future);
+      }
+
+      auto [task, future] = makeReturningSpawningTask(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
+      mPendingTasks.fetch_add(1, std::memory_order_seq_cst);
+      enqueueExternal(task);
+      return std::move(future);
+   }
+
+   void waitForTasks() noexcept
+   {
+      while (mPendingTasks.load(std::memory_order_acquire) != 0)
+      {
+         std::this_thread::yield();
+      }
+   }
+
+
+   void workerLoop(Worker& worker)
+   {
+      mCurrentWorker = &worker;
+
+      constexpr unsigned spinLimit = 64;
+
+      for (;;)
+      {
+         HeapTask* task = nullptr;
+
+         if (tryGetTask(worker, task))
+         {
+            runHeapTask(task);
+            continue;
+         }
+
+         bool foundTask = false;
+
+         for (unsigned spin = 0; spin < spinLimit; ++spin)
+         {
+            _mm_pause();
+
+            if (tryGetTask(worker, task))
+            {
+               foundTask = true;
+               break;
             }
-        }
+         }
 
-        template <class F>
-        void parallel_for(size_t first, size_t last, F&& fn);
+         if (foundTask)
+         {
+            runHeapTask(task);
+            continue;
+         }
 
-        template <class F, class... Args>
-        auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
-            auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
-            auto* worker = workers_[worker_id].get();
-            auto [task, future] = make_returning_task(&worker->free_list, std::forward<F>(f),
-                                                      std::forward<Args>(args)...);
-            // auto [task, future] = make_returning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-            pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-            enqueue_external(worker_id, task);
-            return std::move(future);
-        }
+         if (mStopping.load(std::memory_order_acquire) && mPendingTasks.load(std::memory_order_acquire) == 0)
+         {
+            break;
+         }
 
-        template <class F, class... Args>
-        auto submit_detached(F&& f, Args&&... args) {
-            auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
-            auto* worker = workers_[worker_id].get();
-            HeapTask* task = make_detached_task(&worker->free_list, std::forward<F>(f), std::forward<Args>(args)...);
-            // HeapTask* task = make_detached_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-            pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-            enqueue_external(worker_id, task);
-        }
+         const auto wakeSequence = worker.wakeSequence.load(std::memory_order_acquire);
 
-        template <class F, class... Args>
-        auto submit_detached_ctx(F&& f, Args&&... args) {
-            auto worker_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
-            auto* worker = workers_[worker_id].get();
-            HeapTask* task = make_detached_spawning_task(&worker->free_list, std::forward<F>(f),
-                                                     std::forward<Args>(args)...);
-            // HeapTask* task = make_detached_spawning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
+         if (tryGetTask(worker, task))
+         {
+            runHeapTask(task);
+            continue;
+         }
 
-            pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-            enqueue_external(worker_id, task);
-        }
+         worker.wakeSequence.wait(wakeSequence, std::memory_order_acquire);
+      }
 
-        template <class F, class... Args>
-        auto spawn_detached(F&& f, Args&&... args) {
-            if (curr_worker_ && curr_worker_->pool == this) {
-                HeapTask* task = make_detached_task(&curr_worker_->free_list, std::forward<F>(f),
-                                                std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_relaxed);
-                curr_worker_->deque.push_bottom(task);
-                wake_all_workers();
+      mCurrentWorker = nullptr;
+   }
+
+   bool tryRunOnce(Worker& worker)
+   {
+      HeapTask* task = nullptr;
+
+      if (worker.local.tryPopBottom(task))
+      {
+         runHeapTask(task);
+         return true;
+      }
+
+      if (tryPopInbox(worker, worker, task))
+      {
+         runHeapTask(task);
+         return true;
+      }
+
+      if (tryStealWork(worker, task))
+      {
+         runHeapTask(task);
+         return true;
+      }
+
+      return false;
+   }
+
+   [[nodiscard]]
+   bool tryGetTask(Worker& worker, HeapTask*& task) noexcept
+   {
+      if (worker.local.tryPopBottom(task))
+      {
+         return true;
+      }
+
+      if (tryPopInbox(worker, worker, task))
+      {
+         return true;
+      }
+
+      return tryStealWork(worker, task);
+   }
+
+   [[nodiscard]]
+   bool tryStealWork(Worker& self, HeapTask*& task) noexcept
+   {
+      if (mThreadCount <= 1)
+      {
+         return false;
+      }
+
+      constexpr std::size_t maxAttempts = 4;
+
+      const std::size_t attempts = std::min<std::size_t>(maxAttempts, mThreadCount - 1);
+
+      for (std::size_t attempt = 0; attempt < attempts; ++attempt)
+      {
+         std::size_t victimIndex = self.nextVictim++;
+
+         if (self.nextVictim == mThreadCount)
+         {
+            self.nextVictim = 0;
+         }
+
+         if (victimIndex == self.id)
+         {
+            continue;
+         }
+
+         Worker& victim = *mWorkers[victimIndex];
+
+         if (victim.local.tryStealTop(task))
+         {
+            return true;
+         }
+
+         if (tryPopInbox(self, victim, task))
+         {
+            return true;
+         }
+      }
+
+      return false;
+   }
+
+   void stop()
+   {
+      mStopping.store(true, std::memory_order_release);
+      wakeAllWorkers();
+   }
+
+   void join()
+   {
+      for (auto& worker : mWorkers)
+      {
+         if (worker->thread.joinable())
+         {
+            worker->thread.join();
+         }
+      }
+   }
+
+   class TaskContext
+   {
+      ThreadPool* mPool;
+
+   public:
+      explicit TaskContext(ThreadPool* pool)
+         : mPool{pool}
+      {}
+
+      template<class F, class... Args>
+      void spawnDetached(F&& f, Args&&... args)
+      {
+         mPool->spawnDetached(std::forward<F>(f), std::forward<Args>(args)...);
+      }
+
+      template<class F, class... Args>
+      void spawnDetachedCtx(F&& f, Args&&... args)
+      {
+         mPool->spawnDetachedCtx(std::forward<F>(f), std::forward<Args>(args)...);
+      }
+
+      template<class F, class... Args>
+      auto spawnReturning(F&& f, Args&&... args)
+      {
+         return mPool->spawnReturning(std::forward<F>(f), std::forward<Args>(args)...);
+      }
+
+      template<class F, class... Args>
+      auto spawnReturningCtx(F&& f, Args&&... args)
+      {
+         return mPool->spawnReturningCtx(std::forward<F>(f), std::forward<Args>(args)...);
+      }
+
+      template<class R>
+      R get(std::future<R>& fut)
+      {
+         while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+         {
+            if (!mPool->tryRunOnce(*mCurrentWorker))
+            {
+               std::this_thread::yield();
             }
-            else {
-                HeapTask* task = make_detached_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_relaxed);
-                enqueue_external(task);
-            }
-        }
+         }
 
-        template <class F, class... Args>
-        auto spawn_detached_ctx(F&& f, Args&&... args) {
-            if (curr_worker_ && curr_worker_->pool == this) {
-                HeapTask* task = make_detached_spawning_task(&curr_worker_->free_list, std::forward<F>(f),
-                                                         std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_relaxed);
-                curr_worker_->deque.push_bottom(task);
-                wake_all_workers();
-            }
-            else {
-                HeapTask* task = make_detached_spawning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_relaxed);
-                enqueue_external(task);
-            }
-        }
-
-        template <class F, class... Args>
-        auto spawn_returning(F&& f, Args&&... args) {
-            if (curr_worker_ && curr_worker_->pool == this) {
-                auto [task, future] = make_returning_task(&curr_worker_->free_list, std::forward<F>(f),
-                                                          std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-                curr_worker_->deque.push_bottom(task);
-                wake_all_workers();
-                return std::move(future);
-            }
-
-            auto [task, future] = make_returning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-            pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-            enqueue_external(task);
-            return std::move(future);
-        }
-
-        template <class F, class... Args>
-        auto spawn_returning_ctx(F&& f, Args&&... args) {
-            if (curr_worker_ && curr_worker_->pool == this) {
-                auto [task, future] = make_returning_spawning_task(&curr_worker_->free_list, std::forward<F>(f),
-                                                                   std::forward<Args>(args)...);
-                pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-                curr_worker_->deque.push_bottom(task);
-                wake_all_workers();
-                return std::move(future);
-            }
-
-            auto [task, future] =
-                make_returning_spawning_task(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
-            pending_tasks_.fetch_add(1, std::memory_order_seq_cst);
-            enqueue_external(task);
-            return std::move(future);
-        }
-
-        void wait_for_tasks() noexcept {
-            while (pending_tasks_.load(std::memory_order_acquire) != 0) {
-                std::this_thread::yield();
-            }
-        }
-
-
-        void enqueue_external(std::size_t thread_id, HeapTask* task) {
-            auto worker = workers_[thread_id].get();
-            worker->inbox.push(task);
-            worker->signal.release();
-            // worker->wake_word.fetch_add(1, std::memory_order_release);
-            // futex_wake(worker->wake_word, 1);
-        }
-
-        void enqueue_external(HeapTask* task) {
-            auto thread_id = submit_cursor_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
-            enqueue_external(thread_id, task);
-        }
-
-        void worker_loop(Worker& worker) {
-            curr_worker_ = &worker;
-
-            while (!stopping_.load(std::memory_order_acquire) || pending_tasks_.load(std::memory_order_acquire) != 0) {
-                StackTask* stack_task = nullptr;
-
-                uint64_t worker_gen = worker.gen.load();
-                // 0010
-                // 1110
-                // 0010
-
-                uint64_t curr_task_gen = worker_gen & gen_mask;
-                bool done = (worker_gen & done_bit) != 0;
-
-                if (curr_task_gen != 0 && curr_task_gen != worker.last_task_gen && !done) {
-                    worker.last_task_gen = curr_task_gen;
-                    stack_task = worker.stack_task;
-                    run_stack_task(stack_task);
-                    worker.gen.store(curr_task_gen | done_bit, std::memory_order_release);
-                    continue;
-                }
-
-
-                HeapTask* task = nullptr;
-
-                if (worker.deque.try_pop_bottom(task)) {
-                    run_heap_task(task);
-                    continue;
-                }
-
-                if (worker.inbox.try_pop(task)) {
-                    run_heap_task(task);
-                    continue;
-                }
-
-                if (try_steal_deque(worker, task)) {
-                    run_heap_task(task);
-                    continue;
-                }
-
-                if (try_steal_local(worker, task)) {
-                    run_heap_task(task);
-                    continue;
-                }
-
-                if (worker.stack_inbox.try_pop(stack_task)) {
-                    run_stack_task(stack_task);
-                    continue;
-                }
-
-                if (worker.stack_deque.try_pop_bottom(stack_task)) {
-                    run_stack_task(stack_task);
-                    continue;
-                }
-
-                if (stopping_.load(std::memory_order_acquire) &&
-                    pending_tasks_.load(std::memory_order_acquire) == 0) {
-                    break;
-                }
-
-                if (pending_tasks_.load(std::memory_order_acquire) != 0) {
-                    std::this_thread::yield();
-                    continue;
-                }
-
-                worker.signal.acquire();
-
-                // auto token = worker.wake_word.load(std::memory_order_relaxed);
-
-
-                // if (worker.local.try_pop_bottom(task) ||
-                //     worker.inbox.try_pop(task) ||
-                //     try_steal_deque(worker, task) ||
-                //     try_steal_local(worker, task)) {
-                //     run_task(task);
-                //     continue;
-                // }
-                //
-                // if (pending_tasks_.load(std::memory_order_acquire) == 0) {
-                //     futex_wait(worker.wake_word, token);
-                // }
-
-                // if (stopping_.load(std::memory_order_acquire) && pending_tasks_.load(std::memory_order_acquire) == 0) {
-                //     break;
-                // }
-            }
-
-            curr_worker_ = nullptr;
-        }
-
-        bool try_run_once(Worker& worker) {
-            HeapTask* task = nullptr;
-
-            if (worker.deque.try_pop_bottom(task)) {
-                run_heap_task(task);
-                return true;
-            }
-
-            if (worker.inbox.try_pop(task)) {
-                run_heap_task(task);
-                return true;
-            }
-
-
-            if (try_steal_deque(worker, task)) {
-                run_heap_task(task);
-                return true;
-            }
-
-            return false;
-        }
-
-        bool try_steal_local(Worker& self, HeapTask*& out) {
-            for (auto& worker : workers_) {
-                if (worker.get() == &self) {
-                    continue;
-                }
-
-                if (worker->inbox.try_pop(out)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-
-        bool try_steal_deque(Worker& self, HeapTask*& out) {
-            for (auto& worker : workers_) {
-                if (worker.get() == &self) {
-                    continue;
-                }
-
-                if (worker->deque.try_steal_top(out)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        void stop() {
-            stopping_.store(true, std::memory_order_release);
-            wake_all_workers();
-        }
-
-        void join() {
-            for (auto& worker : workers_) {
-                if (worker->thread.joinable()) {
-                    worker->thread.join();
-                }
-            }
-        }
-
-        class TaskContext {
-            ThreadPool* pool_;
-
-        public:
-            explicit TaskContext(ThreadPool* pool) : pool_{pool} {
-            }
-
-            template <class F, class... Args>
-            void spawn_detached(F&& f, Args&&... args) {
-                pool_->spawn_detached(std::forward<F>(f), std::forward<Args>(args)...);
-            }
-
-            template <class F, class... Args>
-            void spawn_detached_ctx(F&& f, Args&&... args) {
-                pool_->spawn_detached_ctx(std::forward<F>(f),
-                                          std::forward<Args>(args)...);
-            }
-
-            template <class F, class... Args>
-            auto spawn_returning(F&& f, Args&&... args) {
-                return pool_->spawn_returning(
-                    std::forward<F>(f),
-                    std::forward<Args>(args)...
-                );
-            }
-
-            template <class F, class... Args>
-            auto spawn_returning_ctx(F&& f, Args&&... args) {
-                return pool_->spawn_returning_ctx(
-                    std::forward<F>(f),
-                    std::forward<Args>(args)...
-                );
-            }
-
-            template <class R>
-            R get(std::future<R>& fut) {
-                while (fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-                    if (!pool_->try_run_once(*curr_worker_)) {
-                        std::this_thread::yield();
-                    }
-                }
-
-                if constexpr (std::is_void_v<R>) {
-                    fut.get();
-                }
-                else {
-                    return fut.get();
-                }
-            }
-        };
-    };
-}
-
-#include "parallel_for.h"
+         if constexpr (std::is_void_v<R>)
+         {
+            fut.get();
+         }
+         else
+         {
+            return fut.get();
+         }
+      }
+   };
+};
+} //namespace volt

@@ -1,56 +1,49 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <semaphore>
 #include <thread>
 
-#include "mpmc_seq.h"
+#include "spmc.h"
 #include "task_free_list.h"
 #include "work_steal_deque.h"
 
-namespace volt {
-    class ThreadPool;
+namespace volt
+{
+class ThreadPool;
 
-    namespace details {
-        inline constexpr std::size_t kLocalQueueSize = 8192;
-        inline constexpr std::size_t kInboxQueueSize = 8192;
+namespace details
+{
+inline constexpr std::size_t kLocalQueueSize = 8192;
+inline constexpr std::size_t kInboxQueueSize = 8192;
 
-        struct HeapTask {
-            void (*run)(HeapTask*) noexcept;
-            void (*destroy)(HeapTask*) noexcept;
-        };
+struct HeapTask
+{
+   void (*run)(HeapTask*) noexcept;
+   void (*destroy)(HeapTask*) noexcept;
+};
 
-        struct StackTask {
-            void (*run)(StackTask*) noexcept;
-            void (*finish)(StackTask*) noexcept;
-        };
+struct Worker
+{
+   using Inbox = LockFreeQueueSpmcSeq<HeapTask*, kInboxQueueSize>;
+   using Local = WorkStealDeque<HeapTask*, kLocalQueueSize>;
 
-        struct Worker {
-            // using Inbox = LockFreeQueueMpscSeq<HeapTask*, kInboxQueueSize>;
-            using Inbox = LockFreeQueueMpmcSeq<HeapTask*, kInboxQueueSize>;
-            using StackInbox = LockFreeQueueMpmcSeq<StackTask*, kLocalQueueSize>;
-            using LocalDeque = WorkStealDeque<HeapTask*, kLocalQueueSize>;
-            using StackDeque = WorkStealDeque<StackTask*, kLocalQueueSize>;
+   alignas(64) std::atomic<std::uint32_t> wakeSequence{0};
 
-            alignas(128) std::atomic<uint64_t> gen{0};
-            StackTask* stack_task{nullptr};
-            uint64_t last_task_gen{0};
+   ThreadPool*   pool{nullptr};
+   std::uint64_t id{0};
 
-            ThreadPool* pool{nullptr};
-            uint64_t id{0};
-            Inbox inbox;
-            LocalDeque deque;
-            StackInbox stack_inbox;
-            StackDeque stack_deque;
-            std::binary_semaphore signal{0};
-            // std::atomic<uint32_t> wake_word{0};
-            std::thread thread;
-            TaskFreeList free_list;
+   Inbox inbox;
+   Local local;
 
-            Worker() {
-                free_list.reserve(8192);
-            }
-        };
-    }
-}
+   std::thread  thread;
+   TaskFreeList freeList;
+
+   std::size_t nextVictim{0};
+
+   Worker() { freeList.reserve(8192); }
+};
+
+} // namespace details
+} // namespace volt

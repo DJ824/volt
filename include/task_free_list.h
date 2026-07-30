@@ -4,85 +4,97 @@
 #include <mutex>
 #include <vector>
 
-class TaskFreeList {
+class TaskFreeList
+{
 public:
-    static constexpr std::size_t kTaskBytes = 256;
-    static constexpr std::size_t kTaskAlign = alignof(std::max_align_t);
-    static constexpr std::size_t kChunkBlocks = 1024;
+   static constexpr std::size_t kTaskBytes   = 512;
+   static constexpr std::size_t kTaskAlign   = alignof(std::max_align_t);
+   static constexpr std::size_t kChunkBlocks = 8192;
 
 private:
-    struct FreeNode {
-        FreeNode* next;
-    };
+   struct FreeNode
+   {
+      FreeNode* next;
+   };
 
-    static_assert(kTaskBytes >= sizeof(FreeNode));
-    static_assert(kTaskAlign >= alignof(FreeNode));
+   static_assert(kTaskBytes >= sizeof(FreeNode));
+   static_assert(kTaskAlign >= alignof(FreeNode));
 
-    struct alignas(kTaskAlign) Block {
-        std::byte storage[kTaskBytes];
-    };
+   struct alignas(kTaskAlign) Block
+   {
+      std::byte storage[kTaskBytes];
+   };
 
-    FreeNode* head_{nullptr};
-    std::vector<std::unique_ptr<Block[]>> chunks_;
-    std::mutex mutex_;
+   FreeNode*                             head_{nullptr};
+   std::vector<std::unique_ptr<Block[]>> chunks_;
 
-    void allocate_chunk() {
-        auto chunk = std::make_unique<Block[]>(kChunkBlocks);
-        Block* blocks = chunk.get();
-
-        chunks_.push_back(std::move(chunk));
-
-        for (std::size_t i = 0; i < kChunkBlocks; ++i) {
-            auto* node = reinterpret_cast<FreeNode*>(static_cast<void*>(blocks[i].storage));
-            std::construct_at(node, FreeNode{head_});
-            head_ = node;
-        }
-    }
 
 public:
-    TaskFreeList() = default;
+   TaskFreeList() = default;
 
-    TaskFreeList(const TaskFreeList&) = delete;
-    TaskFreeList& operator=(const TaskFreeList&) = delete;
-    TaskFreeList(TaskFreeList&&) = delete;
-    TaskFreeList& operator=(TaskFreeList&&) = delete;
+   TaskFreeList(const TaskFreeList&)            = delete;
+   TaskFreeList& operator=(const TaskFreeList&) = delete;
+   TaskFreeList(TaskFreeList&&)                 = delete;
+   TaskFreeList& operator=(TaskFreeList&&)      = delete;
 
-    [[nodiscard]] static constexpr std::size_t block_size() noexcept {
-        return kTaskBytes;
-    }
+   void allocate_chunk()
+   {
+      auto   chunk  = std::make_unique<Block[]>(kChunkBlocks);
+      Block* blocks = chunk.get();
 
-    [[nodiscard]] static constexpr std::size_t block_align() noexcept {
-        return kTaskAlign;
-    }
+      chunks_.push_back(std::move(chunk));
 
-    [[nodiscard]] void* acquire() {
-        std::lock_guard lock{mutex_};
+      for (std::size_t i = 0; i < kChunkBlocks; ++i)
+      {
+         auto* node = reinterpret_cast<FreeNode*>(static_cast<void*>(blocks[i].storage));
+         std::construct_at(node, FreeNode{head_});
+         head_ = node;
+      }
+   }
 
-        if (head_ == nullptr) {
-            allocate_chunk();
-        }
+   [[nodiscard]]
+   static constexpr std::size_t block_size() noexcept
+   {
+      return kTaskBytes;
+   }
 
-        FreeNode* node = head_;
-        head_ = node->next;
-        std::destroy_at(node);
-        return node;
-    }
+   [[nodiscard]]
+   static constexpr std::size_t block_align() noexcept
+   {
+      return kTaskAlign;
+   }
 
-    void release(void* ptr) noexcept {
-        if (ptr == nullptr) {
-            return;
-        }
+   [[nodiscard]]
+   void* acquire()
+   {
+      if (head_ == nullptr)
+      {
+         allocate_chunk();
+      }
 
-        std::lock_guard lock{mutex_};
-        auto* node = static_cast<FreeNode*>(ptr);
-        std::construct_at(node, FreeNode{head_});
-        head_ = node;
-    }
+      FreeNode* node = head_;
+      head_          = node->next;
+      std::destroy_at(node);
+      return node;
+   }
 
-    void reserve(std::size_t block_count) {
-        std::lock_guard lock{mutex_};
-        while (chunks_.size() * kChunkBlocks < block_count) {
-            allocate_chunk();
-        }
-    }
+   void release(void* ptr) noexcept
+   {
+      if (ptr == nullptr)
+      {
+         return;
+      }
+
+      auto* node = static_cast<FreeNode*>(ptr);
+      std::construct_at(node, FreeNode{head_});
+      head_ = node;
+   }
+
+   void reserve(std::size_t block_count)
+   {
+      while (chunks_.size() * kChunkBlocks < block_count)
+      {
+         allocate_chunk();
+      }
+   }
 };
